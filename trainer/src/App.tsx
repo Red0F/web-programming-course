@@ -1,107 +1,227 @@
-import { useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import {
   countProgress,
   findAnswer,
-  findTask,
   isAnswerFilled,
   type Answer,
 } from "./domain";
 import { trainingSet } from "./set";
 import { TaskCard } from "./components/TaskCard";
+import {
+  createAttemptReducer,
+  createInitialDraft,
+  parseDraft,
+} from "./attempt";
+import {
+  readDraftRaw,
+  removeDraft,
+  writeDraft,
+} from "./draftStorage";
 
-type AttemptStatus = "in-progress" | "submitted";
+const attemptReducer = createAttemptReducer(trainingSet.tasks);
+
+type StorageNotice = {
+  text: string;
+  canReset: boolean;
+};
 
 export default function App() {
-  const [answers, setAnswers] = useState<Answer[]>([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [status, setStatus] = useState<AttemptStatus>("in-progress");
+  const [state, dispatch] = useReducer(
+    attemptReducer,
+    trainingSet,
+    createInitialDraft
+  );
+
+  const [storageReady, setStorageReady] = useState(false);
+  const [storageNotice, setStorageNotice] =
+    useState<StorageNotice | null>(null);
+
+  const skipPersistRef = useRef(true);
+  const didReadRef = useRef(false);
+  const draftBlockedRef = useRef(false);
+
+  // Чтение и проверка черновика
+  useEffect(() => {
+    if (didReadRef.current) return;
+    didReadRef.current = true;
+
+    const result = readDraftRaw();
+
+    if (!result.ok) {
+      setStorageNotice({
+        text: "Не удалось прочитать черновик из localStorage. Ввод продолжается в этой вкладке.",
+        canReset: false,
+      });
+      setStorageReady(true);
+      return;
+    }
+
+    if (result.value === null) {
+      setStorageReady(true);
+      return;
+    }
+
+    const validation = parseDraft(result.value, trainingSet);
+
+    if (validation.kind === "invalid") {
+      // Запрещаем автоматическую перезапись повреждённых данных
+      draftBlockedRef.current = true;
+
+      setStorageNotice({
+        text: `${validation.message} Сохранение приостановлено до явного сброса.`,
+        canReset: true,
+      });
+
+      setStorageReady(true);
+      return;
+    }
+
+    dispatch({ type: "restored", draft: validation.draft });
+    setStorageReady(true);
+  }, []);
+
+  // Сохранение черновика
+  useEffect(() => {
+    if (!storageReady || draftBlockedRef.current) return;
+
+    if (skipPersistRef.current) {
+      skipPersistRef.current = false;
+      return;
+    }
+
+    const result = writeDraft(state);
+
+    if (!result.ok) {
+      setStorageNotice(previous =>
+        previous?.canReset
+          ? previous
+          : {
+              text: "Не удалось сохранить черновик; ввод продолжается в этой вкладке.",
+              canReset: false,
+            }
+      );
+      return;
+    }
+
+    setStorageNotice(previous =>
+      previous?.canReset ? previous : null
+    );
+  }, [state, storageReady]);
 
   const tasks = trainingSet.tasks;
   const totalTasks = tasks.length;
 
-  const currentTask = tasks[currentIndex];
-  const currentAnswer = currentTask ? findAnswer(answers, currentTask.id) : undefined;
+  const currentIndex = tasks.findIndex(
+    task => task.id === state.taskId
+  );
 
-  const progress = countProgress(trainingSet, answers);
+  const safeIndex = Math.max(0, currentIndex);
+  const currentTask = tasks[safeIndex];
 
-  const handleAnswerChange = (newAnswer: Answer) => {
-    if (status === "submitted") {
-      return;
-    }
-    setAnswers((prev) => {
-      const existingIndex = prev.findIndex((a) => a.taskId === newAnswer.taskId);
-      if (existingIndex >= 0) {
-        const updated = [...prev];
-        updated[existingIndex] = newAnswer;
-        return updated;
-      }
-      return [...prev, newAnswer];
-    });
-  };
+  const currentAnswer = currentTask
+    ? findAnswer(state.answers, currentTask.id)
+    : undefined;
 
-  const goToPrevious = () => {
-    if (currentIndex > 0) {
-      setCurrentIndex((i) => i - 1);
+  const progress = countProgress(trainingSet, state.answers);
+
+  // Переход между заданиями
+  const moveTo = (index: number) => {
+    if (index >= 0 && index < totalTasks) {
+      dispatch({
+        type: "moved",
+        taskId: tasks[index].id,
+      });
     }
   };
 
-  const goToNext = () => {
-    if (currentIndex < totalTasks - 1) {
-      setCurrentIndex((i) => i + 1);
-    }
-  };
-
-  const getUnfilledTasks = () => {
-    const unfilled: string[] = [];
-    for (let i = 0; i < tasks.length; i++) {
-      const task = tasks[i];
-      const answer = findAnswer(answers, task.id);
-      if (answer === undefined || !isAnswerFilled(answer)) {
-        unfilled.push(`${i + 1}. ${task.prompt}`);
-      }
-    }
-    return unfilled;
-  };
-
+  // Завершение попытки
   const handleFinish = () => {
-    if (status === "submitted") {
+    if (state.status === "submitted") return;
+
+    const unfilled = tasks.flatMap((task, index) => {
+      const answer = findAnswer(state.answers, task.id);
+
+      return !answer || !isAnswerFilled(answer)
+        ? [`${index + 1}. ${task.prompt}`]
+        : [];
+    });
+
+    if (
+      unfilled.length > 0 &&
+      !window.confirm(
+        "Есть незаполненные задания:\n" +
+          unfilled.map(task => "- " + task).join("\n") +
+          "\n\nЗавершить попытку?"
+      )
+    ) {
       return;
     }
-    const unfilled = getUnfilledTasks();
-    if (unfilled.length > 0) {
-      const message =
-        "Есть незаполненные задания:\n" +
-        unfilled.map((u) => "- " + u).join("\n") +
-        "\n\nЗавершить попытку?";
-      const confirmed = window.confirm(message);
-      if (!confirmed) {
-        return;
-      }
-    }
-    setStatus("submitted");
+
+    dispatch({ type: "submitted" });
   };
 
-  const handleRestart = () => {
-    setAnswers([]);
-    setCurrentIndex(0);
-    setStatus("in-progress");
+  // Явный сброс черновика
+  const handleReset = () => {
+    const result = removeDraft();
+
+    // Разрешаем сохранение только после явного сброса
+    draftBlockedRef.current = false;
+    skipPersistRef.current = true;
+
+    dispatch({
+      type: "reset",
+      draft: createInitialDraft(trainingSet),
+    });
+
+    setStorageReady(true);
+
+    setStorageNotice(
+      result.ok
+        ? null
+        : {
+            text: "Не удалось удалить старый черновик, но новая попытка уже начата.",
+            canReset: false,
+          }
+    );
   };
 
+  const storageBanner = storageNotice && (
+    <div
+      className="storage-notice storage-notice--warning"
+      role="status"
+    >
+      <p>{storageNotice.text}</p>
+
+      {storageNotice.canReset && (
+        <button type="button" onClick={handleReset}>
+          Сбросить черновик
+        </button>
+      )}
+    </div>
+  );
+
+  // Пустой набор заданий
   if (totalTasks === 0) {
     return (
       <main>
+        {storageBanner}
+
         <header>
           <h1>{trainingSet.title}</h1>
           <p>Заданий в наборе: 0</p>
         </header>
+
         <p>В наборе нет заданий.</p>
       </main>
     );
   }
 
-  if (status === "submitted") {
+  // Завершённая попытка
+  if (state.status === "submitted") {
     return (
       <main>
+        {storageBanner}
+
         <header>
           <h1>{trainingSet.title}</h1>
           <p>Попытка завершена</p>
@@ -109,40 +229,58 @@ export default function App() {
             Прогресс: {progress.filled} / {progress.total}
           </p>
         </header>
+
         <section>
           <h2>Обзор ответов</h2>
+
           {tasks.map((task, index) => {
-            const answer = findAnswer(answers, task.id);
-            const filled = answer !== undefined && isAnswerFilled(answer);
+            const answer = findAnswer(state.answers, task.id);
+            const filled =
+              answer !== undefined && isAnswerFilled(answer);
+
             return (
               <article key={task.id} className="task-card">
                 <p>
                   Задание {index + 1}. Тема: {task.topic}
                 </p>
+
                 <h3>{task.prompt}</h3>
-                {task.code !== undefined && <pre>{task.code}</pre>}
+
+                {task.code !== undefined && (
+                  <pre>{task.code}</pre>
+                )}
+
                 {task.kind === "single-choice" ? (
                   <div>
                     <p>Варианты:</p>
+
                     <ul>
-                      {task.options.map((option) => {
-                        const isSelected =
-                          answer && answer.kind === "single-choice"
-                            ? answer.optionId === option.id
-                            : false;
+                      {task.options.map(option => {
+                        const selected =
+                          answer?.kind === "single-choice" &&
+                          answer.optionId === option.id;
+
                         return (
                           <li key={option.id}>
-                            {isSelected ? <strong>{option.label} (выбрано)</strong> : option.label}
+                            {selected ? (
+                              <strong>
+                                {option.label} (выбрано)
+                              </strong>
+                            ) : (
+                              option.label
+                            )}
                           </li>
                         );
                       })}
                     </ul>
+
                     {!filled && <p>Ответ не выбран.</p>}
                   </div>
                 ) : (
                   <div>
                     <p>Ответ:</p>
-                    {filled && answer && answer.kind === "short-text" ? (
+
+                    {filled && answer?.kind === "short-text" ? (
                       <pre>{answer.text}</pre>
                     ) : (
                       <p>Ответ не заполнен.</p>
@@ -153,8 +291,9 @@ export default function App() {
             );
           })}
         </section>
+
         <div style={{ marginTop: "1rem" }}>
-          <button type="button" onClick={handleRestart}>
+          <button type="button" onClick={handleReset}>
             Начать новую попытку
           </button>
         </div>
@@ -162,27 +301,36 @@ export default function App() {
     );
   }
 
+  // Основной экран
   return (
     <main>
+      {storageBanner}
+
       <header>
         <h1>{trainingSet.title}</h1>
+
         <p>
-          Задание {currentIndex + 1} / {totalTasks}
+          Задание {safeIndex + 1} / {totalTasks}
         </p>
+
         <p>
           Прогресс: {progress.filled} / {progress.total}
         </p>
       </header>
+
       {currentTask ? (
         <TaskCard
           task={currentTask}
           answer={currentAnswer}
-          onAnswerChange={handleAnswerChange}
+          onAnswerChange={(answer: Answer) =>
+            dispatch({ type: "answerChanged", answer })
+          }
           readOnly={false}
         />
       ) : (
         <p>Задание не найдено.</p>
       )}
+
       <div
         style={{
           display: "flex",
@@ -191,18 +339,23 @@ export default function App() {
           flexWrap: "wrap",
         }}
       >
-        <button type="button" onClick={goToPrevious} disabled={currentIndex === 0}>
+        <button
+          type="button"
+          onClick={() => moveTo(safeIndex - 1)}
+          disabled={safeIndex === 0}
+        >
           Назад
         </button>
-        {currentIndex < totalTasks - 1 ? (
-          <button type="button" onClick={goToNext}>
+
+        {safeIndex < totalTasks - 1 && (
+          <button
+            type="button"
+            onClick={() => moveTo(safeIndex + 1)}
+          >
             Дальше
           </button>
-        ) : (
-          <button type="button" onClick={handleFinish}>
-            Завершить попытку
-          </button>
         )}
+
         <button type="button" onClick={handleFinish}>
           Завершить попытку
         </button>
